@@ -10,9 +10,14 @@ import (
 	"strings"
 	"os"
 	"sync"
+	"io/ioutil"
+	"mime/multipart"
+	"path/filepath"
+	"bytes"
 	apiv1 "k8s.io/api/core/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 )
@@ -23,10 +28,16 @@ type WorkerSpecs struct {
 	InputFolderPath string `json:"inputFolderPath"`
 }
 
+type UidSpec struct {
+	Uid string `json:"uid"`
+}
+
 type JobDetails struct {
 	sync.Mutex
 	JobName string
 	InputFolderPath string
+	OutputPath string
+	OutputName string
 	TotalWorkers int
 	RunningWorkers int
 	MapperUrl string
@@ -42,14 +53,20 @@ func main() {
 	_ = os.Mkdir("/storage/output", 0755)
 	jobDetailsMap = make(map[string]*JobDetails)
 	http.HandleFunc("/create", createJob)
-	http.HandleFunc("/status", jobStatus)
 	http.HandleFunc("/init", initWorker)
-	if err := http.ListenAndServe(":8000", nil); err != nil {
-		panic(err)
+	http.HandleFunc("/status", jobStatus)
+	http.HandleFunc("/write-chunk", writeChunk)
+	http.HandleFunc("/delete", deleteJob)
+	server := &http.Server{
+		ReadTimeout: 1 * time.Minute,
+		WriteTimeout: 10 * time.Minute,
+		Addr:":8000",
 	}
+	server.ListenAndServe()
 }
 
 func generateUid() string {
+	rand.Seed(time.Now().UnixNano())
 	letters := []rune("abcdefghijklmnopqrstuvwxyz0123456789")
 	s := make([]rune, 10)
 	for i:= range s {
@@ -69,6 +86,8 @@ func createJob(w http.ResponseWriter, r* http.Request) {
 		accessToken := tokens[1]
 		imageUrl := r.PostForm.Get("imageUrl")
 		inputFolderPath := r.PostForm.Get("inputFolderPath")
+		outputPath := r.PostForm.Get("outputPath")
+		outputName := r.PostForm.Get("outputName")
 		workers, _ := strconv.Atoi(r.PostForm.Get("workers"))
 		uid := generateUid()
 		jobName := "mapfunc-" + os.Getenv("COLUMBUS_USERNAME") + "-" + uid
@@ -76,6 +95,8 @@ func createJob(w http.ResponseWriter, r* http.Request) {
 		jobDetailsMap[uid] = &JobDetails{
 			JobName: jobName,
 			InputFolderPath: inputFolderPath,
+			OutputPath: outputPath,
+			OutputName: outputName,
 			TotalWorkers: workers,
 			RunningWorkers: 0,
 			MapperUrl: "http://mapper-" + os.Getenv("COLUMBUS_USERNAME") + "/",
@@ -84,7 +105,12 @@ func createJob(w http.ResponseWriter, r* http.Request) {
 			completedWorkers: 0,
 			accessToken: accessToken,
 		}
+		_ = os.Mkdir("/storage/output/" + uid, 0755)
 		createJobHelper(jobDetailsMap[uid])
+		uidSpec := &UidSpec{
+			Uid: uid,
+		}
+		json.NewEncoder(w).Encode(uidSpec)
 	}
 }
 
@@ -118,6 +144,11 @@ func createJobHelper(jobDetails *JobDetails) {
 									Value: jobDetails.accessToken,
 								},
 							},
+							Resources: apiv1.ResourceRequirements{
+								Requests: apiv1.ResourceList{
+									apiv1.ResourceCPU: resource.MustParse("1"),
+								},
+							},
 
 						},
 					},
@@ -125,6 +156,7 @@ func createJobHelper(jobDetails *JobDetails) {
 				},
 			},
 			Completions: &nWorkers,
+			Parallelism: &nWorkers,
 			BackoffLimit: &retries,
 		},
 	}
@@ -136,6 +168,7 @@ func createJobHelper(jobDetails *JobDetails) {
 }
 
 func jobStatus(w http.ResponseWriter, r *http.Request) {
+	uid := r.URL.Query().Get("uid")
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
@@ -145,11 +178,30 @@ func jobStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	for i := 0; i<10; i++ {
-		fmt.Fprintf(w, "data: %d\n\n", i)
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err.Error())
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	jobDetails := jobDetailsMap[uid]
+	listOptions := metav1.ListOptions{}
+	watcher, err := clientset.BatchV1().Jobs(apiv1.NamespaceDefault).Watch(listOptions)
+	if err != nil {
+		panic(err)
+	}
+	ch := watcher.ResultChan()
+	for event := range ch {
+		jobObject := event.Object.(*batchv1.Job)
+		s, _ := json.Marshal(jobObject.Status)
+		fmt.Fprintf(w, "%s\n", string(s))
 		flusher.Flush()
-		time.Sleep(2 * time.Second)
+		if conditions := jobObject.Status.Conditions; len(conditions) > 0 && conditions[0].Type == "Complete" {
+			uploadToCDrive("/storage/output/" + uid + "/" + jobDetails.OutputName, jobDetails.OutputPath, jobDetails.accessToken)
+			break
+		}
 	}
 }
 
@@ -176,21 +228,93 @@ func initWorker(w http.ResponseWriter, r *http.Request) {
 
 func writeChunk(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
-		if err := r.ParseMultiPartForm(3 << 30); err != nil {
+		if err := r.ParseMultipartForm(3 << 30); err != nil {
 			http.Error(w, "Could not parse form.", http.StatusBadRequest)
 			return
 		}
-		chunk, handler, err := r.FormFile("chunk")
+		chunk, _ , err := r.FormFile("chunk")
 		uid := r.PostForm.Get("uid")
-		if err := nil {
+		if err != nil {
 			panic(err)
 		}
-		defer chunk.close()
+		defer chunk.Close()
 		chunkBytes, err := ioutil.ReadAll(chunk)
 
-		filePath := "/storage/output/" + uid + ".csv"
+		jobDetails := jobDetailsMap[uid]
+
+		filePath := "/storage/output/" + uid + "/" + jobDetails.OutputName
+		if _, err := os.Stat(filePath); err == nil {
+			chunkBytes = chunkBytes[ bytes.IndexByte(chunkBytes, byte('\n')) + 1 : ]
+		}
 		file, err := os.OpenFile(filePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		defer file.close()
+		defer file.Close()
 		file.Write(chunkBytes)
+	}
+}
+
+func uploadToCDrive(localPath, cDrivePath, accessToken string) {
+	url := "http://cdrive/multi-part-form-upload/"
+	file, err := os.Open(localPath)
+	if err != nil {
+		panic(err)
+	}
+	fileContents, err := ioutil.ReadAll(file)
+	if err != nil {
+		panic(err)
+	}
+	file.Close()
+
+	body := new(bytes.Buffer)
+	writer := multipart.NewWriter(body)
+	part, err := writer.CreateFormFile("file", filepath.Base(file.Name()))
+	if err != nil {
+		panic(err)
+	}
+	part.Write(fileContents)
+	_ = writer.WriteField("path", cDrivePath)
+	writer.Close()
+	request, err := http.NewRequest("POST", url, body)
+	if err != nil {
+		panic(err)
+	}
+	request.Header.Add("Content-Type", writer.FormDataContentType())
+	request.Header.Add("Authorization", "Bearer " + accessToken)
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		panic(err)
+	}
+	defer response.Body.Close()
+	_ , err = ioutil.ReadAll(response.Body)
+	if err != nil {
+		panic(err)
+	}
+}
+
+func deleteJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "Could not parse form.", http.StatusBadRequest)
+			return
+		}
+		uid := r.PostForm.Get("uid")
+
+		deletePolicy := metav1.DeletePropagationForeground
+
+		config, err := rest.InClusterConfig()
+		if err != nil {
+			panic(err.Error())
+		}
+
+		clientset, err := kubernetes.NewForConfig(config)
+		if err != nil {
+			panic(err.Error())
+		}
+		jobDetails := jobDetailsMap[uid]
+		jobsClient := clientset.BatchV1().Jobs(apiv1.NamespaceDefault)
+		_ = jobsClient.Delete(jobDetails.JobName, &metav1.DeleteOptions{PropagationPolicy: &deletePolicy})
+		delete(jobDetailsMap, uid)
 	}
 }
