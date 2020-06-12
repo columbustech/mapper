@@ -14,6 +14,7 @@ import (
 	"mime/multipart"
 	"path/filepath"
 	"bytes"
+	"reflect"
 	apiv1 "k8s.io/api/core/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,6 +31,21 @@ type WorkerSpecs struct {
 
 type UidSpec struct {
 	Uid string `json:"uid"`
+}
+
+type Fields struct {
+	Key string `json:"key"`
+	XAmzAlgorithm string `json:"x-amz-algorithm"`
+	XAmzCredential string `json:"x-amz-credential"`
+	XAmzDate string `json:"x-amz-date"`
+	Policy string `json:"policy"`
+	XAmzSignature string `json:"x-amz-signature"`
+}
+
+type UploadSpec struct {
+	Url string `json:"url"`
+	Fields Fields `json:"fields"`
+	UploadId string `json:"uploadId"`
 }
 
 type JobDetails struct {
@@ -57,6 +73,7 @@ func main() {
 	http.HandleFunc("/status", jobStatus)
 	http.HandleFunc("/write-chunk", writeChunk)
 	http.HandleFunc("/delete", deleteJob)
+	http.HandleFunc("/upload", uploadOutput)
 	server := &http.Server{
 		ReadTimeout: 1 * time.Minute,
 		WriteTimeout: 10 * time.Minute,
@@ -165,6 +182,34 @@ func createJobHelper(jobDetails *JobDetails) {
 		panic(err)
 	}
 	fmt.Printf("Created Job %q.\n", result.GetObjectMeta().GetName())
+	go watchJob(jobDetails)
+}
+
+func watchJob(jobDetails *JobDetails) {
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err.Error())
+	}
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		panic(err.Error())
+	}
+	labelSelector := fmt.Sprintf("job-name=%s", jobDetails.JobName)
+	listOptions := metav1.ListOptions{
+		LabelSelector: labelSelector,
+	}
+	watcher, err := clientset.BatchV1().Jobs(apiv1.NamespaceDefault).Watch(listOptions)
+	if err != nil {
+		panic(err)
+	}
+	ch := watcher.ResultChan()
+	for event := range ch {
+		jobObject := event.Object.(*batchv1.Job)
+		if conditions := jobObject.Status.Conditions; len(conditions) > 0 && conditions[0].Type == "Complete" {
+			uploadToCDrive("/storage/output/" + jobDetails.uid + "/" + jobDetails.OutputName, jobDetails.OutputPath, jobDetails.accessToken)
+			break
+		}
+	}
 }
 
 func jobStatus(w http.ResponseWriter, r *http.Request) {
@@ -187,7 +232,10 @@ func jobStatus(w http.ResponseWriter, r *http.Request) {
 		panic(err.Error())
 	}
 	jobDetails := jobDetailsMap[uid]
-	listOptions := metav1.ListOptions{}
+	labelSelector := fmt.Sprintf("job-name=%s", jobDetails.JobName)
+	listOptions := metav1.ListOptions{
+		LabelSelector: labelSelector,
+	}
 	watcher, err := clientset.BatchV1().Jobs(apiv1.NamespaceDefault).Watch(listOptions)
 	if err != nil {
 		panic(err)
@@ -199,7 +247,6 @@ func jobStatus(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%s\n", string(s))
 		flusher.Flush()
 		if conditions := jobObject.Status.Conditions; len(conditions) > 0 && conditions[0].Type == "Complete" {
-			uploadToCDrive("/storage/output/" + uid + "/" + jobDetails.OutputName, jobDetails.OutputPath, jobDetails.accessToken)
 			break
 		}
 	}
@@ -252,8 +299,46 @@ func writeChunk(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func uploadOutput(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, "Could not parse form.", http.StatusBadRequest)
+			return
+		}
+		authUrl := r.Header.Get("Authorization")
+		tokens := strings.Split(authUrl, " ")
+		accessToken := tokens[1]
+		localPath := r.PostForm.Get("localPath")
+		cdrivePath := r.PostForm.Get("cdrivePath")
+		uploadToCDrive(localPath, cdrivePath, accessToken)
+	}
+}
+
 func uploadToCDrive(localPath, cDrivePath, accessToken string) {
-	url := "http://cdrive/multi-part-form-upload/"
+	uploadSpec := initiateUpload(localPath, cDrivePath, accessToken)
+	presignedUpload(uploadSpec, localPath)
+	completeUpload(uploadSpec, accessToken)
+}
+
+func initiateUpload(localPath, cDrivePath, accessToken string) *UploadSpec{
+	url := "http://cdrive/initiate-upload-alt/"
+	var jsonStr = []byte(fmt.Sprintf(`{"path":"%s/%s"}`, cDrivePath, filepath.Base(localPath)))
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonStr))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Add("Authorization", "Bearer " + accessToken)
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	uploadSpec := UploadSpec{}
+	json.NewDecoder(resp.Body).Decode(&uploadSpec)
+	resp.Body.Close()
+	return &uploadSpec
+}
+
+func presignedUpload(uploadSpec *UploadSpec, localPath string) {
+	url := uploadSpec.Url
 	file, err := os.Open(localPath)
 	if err != nil {
 		panic(err)
@@ -266,19 +351,24 @@ func uploadToCDrive(localPath, cDrivePath, accessToken string) {
 
 	body := new(bytes.Buffer)
 	writer := multipart.NewWriter(body)
+
+	val := reflect.ValueOf(uploadSpec.Fields)
+	for i := 0; i < val.Type().NumField(); i++ {
+		tag := val.Type().Field(i).Tag.Get("json")
+		fieldVal := val.Field(i).Interface()
+		_ = writer.WriteField(tag, fmt.Sprintf("%v", fieldVal))
+	}
 	part, err := writer.CreateFormFile("file", filepath.Base(file.Name()))
 	if err != nil {
 		panic(err)
 	}
 	part.Write(fileContents)
-	_ = writer.WriteField("path", cDrivePath)
 	writer.Close()
 	request, err := http.NewRequest("POST", url, body)
 	if err != nil {
 		panic(err)
 	}
 	request.Header.Add("Content-Type", writer.FormDataContentType())
-	request.Header.Add("Authorization", "Bearer " + accessToken)
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
@@ -291,6 +381,20 @@ func uploadToCDrive(localPath, cDrivePath, accessToken string) {
 	if err != nil {
 		panic(err)
 	}
+}
+
+func completeUpload(uploadSpec *UploadSpec, accessToken string) {
+	url := "http://cdrive/complete-upload-alt/"
+	var jsonStr = []byte(fmt.Sprintf(`{"uploadId":"%s"}`, uploadSpec.UploadId))
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonStr))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Add("Authorization", "Bearer " + accessToken)
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		panic(err)
+	}
+	resp.Body.Close()
 }
 
 func deleteJob(w http.ResponseWriter, r *http.Request) {
